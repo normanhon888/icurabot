@@ -1,0 +1,156 @@
+from __future__ import annotations
+import os, json
+from typing import Any
+from flask import Blueprint, request, jsonify, current_app
+bp = Blueprint("health", __name__)
+def _json_default(o: Any):
+    if hasattr(o, "model_dump"):
+        try: return o.model_dump()
+        except Exception: pass
+    if hasattr(o, "dict"):
+        try: return o.dict()
+        except Exception: pass
+    if hasattr(o, "__dict__"): return dict(o.__dict__)
+    return str(o)
+def _json_response(obj: Any, status: int = 200):
+    return current_app.response_class(json.dumps(obj, default=_json_default, ensure_ascii=False),
+                                      status=status, mimetype="application/json")
+def _get_client():
+    from openai import OpenAI
+    kw = {}
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key: kw["api_key"] = api_key
+    base_url = (os.getenv("OPENAI_BASE_URL") or "").rstrip("/")
+    if base_url: kw["base_url"] = base_url
+    api_version = os.getenv("OPENAI_API_VERSION")
+    if api_version: kw.setdefault("default_query", {})["api-version"] = api_version
+    return OpenAI(**kw) if api_key else None
+def _as_int(x, default=256):
+    try: return int(x) if x is not None else default
+    except Exception: return default
+def _as_float(x, default=0.2):
+    try: return float(x) if x is not None else default
+    except Exception: return default
+@bp.get("/healthz")
+def healthz():
+    return jsonify({"ok": True})
+@bp.get("/version")
+def version():
+    return jsonify({
+        "app": "icurabot",
+        "build": os.getenv("ICURABOT_BUILD", "20250820"),
+        "model_default": os.getenv("OPENAI_MODEL_DEFAULT", "gpt-4o-mini"),
+        "model_upgrade": os.getenv("OPENAI_MODEL_UPGRADE", "gpt-4o"),
+        "ok": True
+    }), 200
+@bp.route("/chat", methods=["OPTIONS"])
+def chat_preflight():
+    return ("", 204)
+@bp.post("/chat")
+def chat():
+    data = request.get_json(silent=True) or {}
+    user_msg   = (data.get("message") or "").strip() or "Hello!"
+    model      = data.get("model") or os.getenv("OPENAI_MODEL_DEFAULT", "gpt-4o-mini")
+    temperature= _as_float(data.get("temperature") or os.getenv("OPENAI_TEMPERATURE", 0.2), 0.2)
+    max_tokens = _as_int(data.get("max_tokens") or os.getenv("OPENAI_MAX_TOKENS", 256), 256)
+    client = _get_client()
+    if client is None:
+        return _json_response({
+            "ok": True, "message": f"[stub] {user_msg}", "model": "stub",
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }, 200)
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant for NZ Insure."},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        text = resp.choices[0].message.content if resp.choices else ""
+        usage = resp.usage.model_dump() if hasattr(resp.usage, "model_dump") else {
+            "prompt_tokens": getattr(resp.usage, "prompt_tokens", None),
+            "completion_tokens": getattr(resp.usage, "completion_tokens", None),
+            "total_tokens": getattr(resp.usage, "total_tokens", None),
+        }
+        return _json_response({
+            "ok": True, "message": text, "model": resp.model, "id": resp.id,
+            "created": resp.created, "usage": usage,
+        }, 200)
+    except Exception as e:
+        return _json_response({
+            "ok": True, "message": f"[degraded] {user_msg}", "error": str(e),
+            "model": "fallback", "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }, 200)
+
+# @bp.post("/legacy/lead/create")  # DISABLED: moved to hubspot_routes
+def lead_create_legacy():
+    import requests, time
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return _json_response({"ok": False, "error": "email_required"}, 400)
+
+    # 允许的字段白名单（按需扩展 HubSpot 属性）
+    props_map = {
+        "email": "email",
+        "first_name": "firstname",
+        "last_name": "lastname",
+        "phone": "phone",
+        "mobile": "mobilephone",
+        "company": "company",
+        "source": "lead_source",
+        "utm_source": "utm_source",
+        "utm_medium": "utm_medium",
+        "utm_campaign": "utm_campaign",
+        "utm_term": "utm_term",
+        "utm_content": "utm_content",
+    }
+    props = {"email": email}
+    for k, hs_name in props_map.items():
+        v = data.get(k)
+        if v is not None and k != "email":
+            props[hs_name] = str(v)
+
+    token = os.getenv("HUBSPOT_PRIVATE_APP_TOKEN")
+    if not token:
+        return _json_response({"ok": False, "error": "hubspot_token_missing"}, 500)
+
+    # v3 batch upsert（单条也可用 batch，简洁可靠）
+    url = "https://api.hubapi.com/crm/v3/objects/contacts/batch/upsert"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {
+        "inputs": [
+            {"properties": props}
+        ]
+    }
+
+    # 用 email 做唯一键
+    params = {"idProperty": "email"}
+
+    t0 = time.time()
+    try:
+        r = requests.post(url, headers=headers, params=params, json=payload, timeout=10)
+        took = round((time.time() - t0) * 1000)
+        if r.status_code not in (200, 201, 207):  # 207 = multi-status
+            return _json_response({"ok": False, "status": r.status_code, "body": r.text}, 502)
+
+        res = r.json()
+        # 结果结构通常在 results[0]
+        results = res.get("results") or []
+        rid = (results[0].get("id") if results else None)
+        properties = (results[0].get("properties") if results else {})
+        created_at = properties.get("createdate")
+        updated_at = properties.get("lastmodifieddate")
+        created = (created_at == updated_at) if (created_at and updated_at) else None
+
+        return _json_response({
+            "ok": True,
+            "hubspot_id": rid,
+            "created": created,
+            "took_ms": took
+        }, 200)
+    except Exception as e:
+        return _json_response({"ok": False, "error": type(e).__name__, "message": str(e)}, 500)

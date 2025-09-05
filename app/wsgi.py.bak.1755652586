@@ -1,0 +1,20 @@
+import sys, traceback
+from dotenv import load_dotenv
+try:
+    load_dotenv('/opt/icurabot/.env')
+except Exception as e:
+    sys.stderr.write(f"[dotenv] warning: {e}\n")
+
+try:
+    from app.health import app as real_app
+    app = real_app
+except Exception:
+    sys.stderr.write("[bootstrap] failed to import app.health:\n" + traceback.format_exc() + "\n")
+    from flask import Flask, jsonify
+    app = Flask(__name__)
+    @app.route("/ping")
+    def ping():
+        return jsonify({"ok": True, "fallback": True}), 200
+    @app.route("/version")
+    def version():
+        return jsonify({"ok": False, "bootstrap": "fallback"}), 500

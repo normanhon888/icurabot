@@ -1,0 +1,119 @@
+import os, uuid
+from flask import Flask, jsonify, request
+from .ai_gateway import chat as ai_chat
+from .hubspot_api import create_or_update_contact, create_deal, associate_deal_contact, find_contact_by_email
+
+app = Flask(__name__)
+
+APP_NAME = os.getenv("APP_NAME", "icurabot")
+MODEL_DEFAULT = os.getenv("MODEL_DEFAULT", "gpt-4o-mini")
+MODEL_UPGRADE = os.getenv("MODEL_UPGRADE", "gpt-4o")
+BUILD_TAG = os.getenv("BUILD_TAG", "dev")
+
+@app.route("/version")
+def version():
+    return jsonify({
+        "app": APP_NAME,
+        "build": BUILD_TAG,
+        "model_default": MODEL_DEFAULT,
+        "model_upgrade": MODEL_UPGRADE
+    }), 200
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.get_json(silent=True) or {}
+    user_msg = (data.get("message") or "").strip()
+    force = data.get("force")
+    req_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    try:
+        if not user_msg:
+            raise ValueError("empty message")
+        system = ("你是“小盛助手 iCura”，面向新西兰华人客户的保险顾问助手。"
+                  "回答务必准确、简洁，必要时给出下一步动作或所需资料。")
+        res = ai_chat(user_msg, force=force, system=system)
+        if res.get("usage") and not isinstance(res.get("usage"), dict):
+            res.pop("usage", None)
+        res["request_id"] = req_id
+        return jsonify(res), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "request_id": req_id}), 200
+
+@app.route("/lead/create", methods=["POST"])
+def lead_create():
+    data = request.get_json(silent=True) or {}
+    props = {k: v for k, v in {
+        "email": data.get("email"),
+        "phone": data.get("phone"),
+        "firstname": data.get("firstname"),
+        "lastname": data.get("lastname"),
+        "company": data.get("company"),
+    }.items() if v not in (None, "")}
+    try:
+        result = create_or_update_contact(props)
+        return jsonify({"ok": True, "contact_id": result["id"], "action": result["action"]}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 200
+
+@app.route("/deal/update", methods=["POST"])
+def deal_update():
+    data = request.get_json(silent=True) or {}
+    contact_email = data.get("contact_email")
+    try:
+        contact_id = None
+        if contact_email:
+            ex = find_contact_by_email(contact_email)
+            if ex:
+                contact_id = ex["id"]
+            else:
+                res = create_or_update_contact({"email": contact_email})
+                contact_id = res["id"]
+        deal_id = create_deal({
+            "dealname": data.get("dealname"),
+            "amount": data.get("amount"),
+            "pipeline": data.get("pipeline"),
+            "dealstage": data.get("dealstage"),
+        })
+        if contact_id:
+            associate_deal_contact(deal_id, contact_id)
+        return jsonify({"ok": True, "deal_id": deal_id, "contact_id": contact_id}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 200
+
+@app.route("/wix/webhook", methods=["POST"])
+def wix_webhook():
+    expected = os.getenv("WIX_WEBHOOK_SECRET", "")
+    supplied = (
+        request.headers.get("Authorization", "").replace("Bearer ", "", 1)
+        or request.headers.get("X-Webhook-Secret")
+        or request.args.get("wix_secret")
+        or (request.get_json(silent=True) or {}).get("secret")
+    )
+    if expected and supplied != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    payload = request.get_json(silent=True) or {}
+    # 尝试从 Wix payload 提取联系人并同步到 HubSpot（若无关键字段则仅回显）
+    def pick(d, *keys):
+        for k in keys:
+            if not d: break
+            if isinstance(k, int):
+                d = (d[k] if isinstance(d, list) and len(d) > k else None)
+            else:
+                d = d.get(k) if isinstance(d, dict) else None
+        return d
+    contact = payload.get("contact") or payload.get("data", {}).get("contact") or payload
+    email = (pick(contact,"primaryEmail")
+             or pick(contact,"emails",0,"email")
+             or contact.get("email")
+             or payload.get("email"))
+    first = (contact.get("firstName") or contact.get("firstname")
+             or (contact.get("name") or "").split(" ")[0] if contact.get("name") else None)
+    last  = (contact.get("lastName") or contact.get("lastname")
+             or (contact.get("name") or "").split(" ")[-1] if contact.get("name") else None)
+    synced = None
+    if email:
+        try:
+            r = create_or_update_contact({"email": email, "firstname": first, "lastname": last})
+            synced = {"contact_id": r["id"], "action": r["action"]}
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e), "echo": payload}), 200
+    return jsonify({"ok": True, "synced": synced, "echo": payload}), 200
